@@ -16,6 +16,7 @@ DAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sun
 HELP = """Fitness tracker
 
 Today workout pls
+Tomorrow workout
 Give me present diet chart
 Update my diet from today
 Today weight is 74.5
@@ -269,11 +270,30 @@ def respond(db, update_id, message, now):
         workouts = dict(db.execute("SELECT day, routine FROM workouts"))
         return "\n\n".join(f"{weekday}\n{workouts.get(weekday, 'No workout saved.')}"
                             for weekday in DAYS)
-    if command == "/workout" or phrase in {
-        "today workout pls", "today work out pls", "today workout", "today's workout", "workout today",
-        "what is my workout today", "what's my workout today",
-    }:
-        weekday = DAYS[now.weekday()]
+    if command == "/workout" or re.search(r"\b(?:workout|work out)\b", phrase):
+        workout_request = argument.casefold().strip() if command == "/workout" else phrase
+        day_match = re.search(
+            r"\b(day after tomorrow|tomorrow|today|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+            workout_request,
+        )
+        if day_match:
+            requested_day = day_match.group(1)
+            if requested_day == "day after tomorrow":
+                target_date = now.date() + timedelta(days=2)
+                weekday = DAYS[target_date.weekday()]
+            elif requested_day == "tomorrow":
+                target_date = now.date() + timedelta(days=1)
+                weekday = DAYS[target_date.weekday()]
+            elif requested_day == "today":
+                weekday = DAYS[now.weekday()]
+            else:
+                weekday = requested_day.title()
+        elif command == "/workout" and not workout_request:
+            weekday = DAYS[now.weekday()]
+        elif command == "/workout" and workout_request in {"workout", "work out"}:
+            weekday = DAYS[now.weekday()]
+        else:
+            return "Ask for today, tomorrow, or a weekday, such as 'Friday workout'."
         row = db.execute("SELECT routine FROM workouts WHERE day = ?", (weekday,)).fetchone()
         return f"{weekday} workout\n\n{row[0]}" if row else (
             f"No workout saved for {weekday}. Add one using /setworkout {weekday}: ..."
