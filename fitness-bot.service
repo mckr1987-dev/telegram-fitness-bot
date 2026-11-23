@@ -13,7 +13,10 @@ ExecStart=/usr/bin/python3 /opt/fitness-bot/bot.py
 Restart=always
 RestartSec=5
 NoNewPrivileges=true
-ProtectSystem=full
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 ReadWritePaths=/opt/fitness-bot/data
 
 [Install]
