@@ -1,0 +1,20 @@
+[Unit]
+Description=Telegram Fitness Tracker Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=fitnessbot
+Group=fitnessbot
+WorkingDirectory=/opt/fitness-bot
+EnvironmentFile=/etc/fitness-bot.env
+ExecStart=/usr/bin/python3 /opt/fitness-bot/bot.py
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=full
+ReadWritePaths=/opt/fitness-bot/data
+
+[Install]
+WantedBy=multi-user.target
