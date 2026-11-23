@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -11,8 +12,13 @@ from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+log = logging.getLogger("fitness-bot")
+
 IST = timezone(timedelta(hours=5, minutes=30), "IST")
 DAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+TELEGRAM_TEXT_LIMIT = 4000  # Telegram allows 4096 characters; keep a margin.
+PENDING_DIET_TTL = timedelta(minutes=30)
+MIN_DIET_LENGTH = 15
 HELP = """Fitness tracker
 
 Today workout pls
@@ -20,18 +26,37 @@ Tomorrow workout
 Give me present diet chart
 Update my diet from today
 Today weight is 74.5
+Yesterday weight was 74.8
 
 Save a workout with /setworkout Monday: Squats 3x8 (use any weekday).
 See the week with /week. Use “Rest day” for a day off.
+Log an earlier day with /weight 2026-11-20 74.2.
 Send /progress or 'How am I progressing?' for your weight trend.
 Ask 'Give my progress for last 3 weeks' for a shorter report.
 Use /diet_history or /weight_history to see recent entries.
 Use /cancel to cancel a pending diet update."""
 
+DIET_SHOW_PHRASES = {
+    "give me present diet chart", "give me my present diet chart",
+    "show my diet", "current diet", "present diet chart",
+}
+PROGRESS_PHRASES = {
+    "show my progress", "show my weight progress", "how am i progressing",
+    "how i am progressing", "weight progress", "progress", "how am i doing",
+}
+DIET_UPDATE_PHRASE = "update my diet from today"
+# Exact phrases that keep their normal meaning even while a diet paste is pending.
+EXACT_PHRASES = DIET_SHOW_PHRASES | PROGRESS_PHRASES | {DIET_UPDATE_PHRASE}
+
 WEIGHT = re.compile(
-    r"(?:today(?:'s)?\s+weight|my weight(?: today)?|weight(?: today)?)"
-    r"\s*(?:is\s+|[:=]\s*)?(\d{1,3}(?:[.,]\d{1,2})?)\s*(?:kg)?[.!]?",
+    r"(?:(today|yesterday)(?:'s)?\s+weight|my weight(?:\s+(today|yesterday))?|weight(?:\s+(today|yesterday))?)"
+    r"\s*(?:(?:is|was)\s+|[:=]\s*)?(\d{1,3}(?:[.,]\d{1,2})?)\s*(?:kg)?[.!]?",
     re.IGNORECASE,
+)
+DATED_WEIGHT = re.compile(r"(\d{4}-\d{2}-\d{2})\s+(\d{1,3}(?:[.,]\d{1,2})?)\s*(?:kg)?")
+WORKOUT_WORD = re.compile(r"\bwork ?outs?\b")
+WORKOUT_DAY = re.compile(
+    r"\b(day after tomorrow|tomorrow|today|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b"
 )
 
 
@@ -57,11 +82,173 @@ def connect(path):
     return db
 
 
+def plural(count, word):
+    return f"{count} {word}{'s' if count != 1 else ''}"
+
+
+# ---------------------------------------------------------------- diet
+
 def save_diet(db, update_id, day, chart):
     db.execute("INSERT INTO diets VALUES (?, ?, ?)", (update_id, day, chart))
     db.execute("DELETE FROM settings WHERE name = 'pending_diet'")
     return f"Diet saved for {day}. Previous versions are available in /diet_history."
 
+
+def set_pending_diet(db, day, now):
+    value = json.dumps({"day": day, "since": now.isoformat()})
+    db.execute("INSERT OR REPLACE INTO settings VALUES ('pending_diet', ?)", (value,))
+
+
+def pending_diet_day(db, now):
+    """Return the effective day of a pending diet update, or None if none is pending or it expired."""
+    row = db.execute("SELECT value FROM settings WHERE name = 'pending_diet'").fetchone()
+    if not row:
+        return None
+    try:
+        pending = json.loads(row[0])
+        day, since = pending["day"], datetime.fromisoformat(pending["since"])
+    except (ValueError, TypeError, KeyError):
+        return row[0]  # Older versions stored the plain day; treat it as still pending.
+    if now - since > PENDING_DIET_TTL:
+        db.execute("DELETE FROM settings WHERE name = 'pending_diet'")
+        return None
+    return day
+
+
+def handle_diet(db, update_id, message, command, argument, phrase, now):
+    day = now.date().isoformat()
+    if command == "/diet" or phrase in DIET_SHOW_PHRASES:
+        row = db.execute(
+            "SELECT effective, chart FROM diets WHERE effective <= ? "
+            "ORDER BY effective DESC, update_id DESC LIMIT 1", (day,)
+        ).fetchone()
+        return f"Diet from {row[0]}\n\n{row[1]}" if row else (
+            'No diet saved yet. Send "Update my diet from today" to add one.'
+        )
+    if command == "/diet_history":
+        if argument:
+            row = db.execute(
+                "SELECT effective, chart FROM diets WHERE update_id = ?", (argument,)
+            ).fetchone()
+            return f"Diet from {row[0]}\n\n{row[1]}" if row else "Diet version not found."
+        rows = db.execute(
+            "SELECT update_id, effective, chart FROM diets "
+            "ORDER BY effective DESC, update_id DESC LIMIT 10"
+        ).fetchall()
+        return "\n".join(
+            f"{effective} | {chart.splitlines()[0][:60]} | /diet_history {version}"
+            for version, effective, chart in rows
+        ) or "No diet history yet."
+    diet_prompt = re.fullmatch(r"update my diet from today(?:\s*[:\-]\s*(.+))?", message,
+                               flags=re.IGNORECASE | re.DOTALL)
+    if command == "/setdiet" or diet_prompt or phrase == DIET_UPDATE_PHRASE:
+        if command == "/setdiet":
+            chart = argument.strip()
+        else:
+            chart = (diet_prompt.group(1) or "").strip() if diet_prompt else ""
+        if chart:
+            return save_diet(db, update_id, day, chart)
+        set_pending_diet(db, day, now)
+        return (f"Paste the full diet chart in your next message to save it from {day}. "
+                "Send /cancel to stop.")
+    return None
+
+
+# ------------------------------------------------------------- workouts
+
+def handle_workout(db, update_id, message, command, argument, phrase, now):
+    if command == "/setworkout":
+        weekday, separator, routine = argument.partition(":")
+        weekday = weekday.strip().title()
+        if weekday not in DAYS or not separator or not routine.strip():
+            return "Use /setworkout Monday: Squats 3x8 (use any weekday)."
+        db.execute("INSERT OR REPLACE INTO workouts VALUES (?, ?)", (weekday, routine.strip()))
+        return f"{weekday} workout saved."
+    if command == "/week":
+        return week_schedule(db)
+    if command != "/workout" and (command.startswith("/") or not WORKOUT_WORD.search(phrase)):
+        return None
+
+    request = argument.casefold().strip() if command == "/workout" else phrase
+    day_match = WORKOUT_DAY.search(request)
+    if day_match:
+        offsets = {"today": 0, "tomorrow": 1, "day after tomorrow": 2}
+        requested = day_match.group(1)
+        if requested in offsets:
+            weekday = DAYS[(now.date() + timedelta(days=offsets[requested])).weekday()]
+        else:
+            weekday = requested.title()
+    elif command == "/workout" and request in {"", "workout", "work out"}:
+        weekday = DAYS[now.weekday()]
+    elif re.search(r"\bwork ?outs\b|\bweek\b", request):
+        return week_schedule(db)
+    else:
+        return "Ask for today, tomorrow, or a weekday, such as 'Friday workout'."
+    row = db.execute("SELECT routine FROM workouts WHERE day = ?", (weekday,)).fetchone()
+    return f"{weekday} workout\n\n{row[0]}" if row else (
+        f"No workout saved for {weekday}. Add one using /setworkout {weekday}: ..."
+    )
+
+
+def week_schedule(db):
+    workouts = dict(db.execute("SELECT day, routine FROM workouts"))
+    return "\n\n".join(f"{weekday}\n{workouts.get(weekday, 'No workout saved.')}"
+                       for weekday in DAYS)
+
+
+# -------------------------------------------------------------- weights
+
+def save_weight(db, day, raw_kg):
+    kg = Decimal(raw_kg.replace(",", "."))
+    if not 0 < kg <= 999:
+        return 'Enter a positive weight in kg, for example "Today weight is 74.5".'
+    value = f"{kg.normalize():f}"
+    db.execute("INSERT OR REPLACE INTO weights VALUES (?, ?)", (day.isoformat(), value))
+    return f"Saved {value} kg for {day.isoformat()}. A new entry for that day replaces it."
+
+
+def handle_weight(db, update_id, message, command, argument, phrase, now):
+    today = now.date()
+    if command == "/weight_history":
+        rows = db.execute("SELECT day, kg FROM weights ORDER BY day DESC LIMIT 30").fetchall()
+        return "\n".join(f"{day} | {kg} kg" for day, kg in rows) or "No weights logged yet."
+    if command == "/weight":
+        dated = DATED_WEIGHT.fullmatch(argument.strip())
+        if dated:
+            try:
+                day = date.fromisoformat(dated.group(1))
+            except ValueError:
+                return "Use a real date, for example /weight 2026-11-20 74.2."
+            if day > today:
+                return "You can't log a weight for a future date."
+            return save_weight(db, day, dated.group(2))
+    elif command.startswith("/"):
+        return None
+
+    reading = WEIGHT.fullmatch(phrase if command != "/weight" else f"weight {argument.casefold()}")
+    if reading:
+        when = reading.group(1) or reading.group(2) or reading.group(3) or "today"
+        day = today - timedelta(days=1) if when == "yesterday" else today
+        return save_weight(db, day, reading.group(4))
+    if command == "/weight" or phrase.startswith(
+        ("today weight", "today's weight", "my weight", "yesterday weight", "yesterday's weight")
+    ):
+        return 'Enter your weight in kg, for example "Today weight is 74.5".'
+    return None
+
+
+def weekly_averages(rows):
+    """Group (day, kg) rows by the Monday that starts each week, in date order."""
+    weeks = {}
+    for logged_day, kg in rows:
+        reading_day = date.fromisoformat(logged_day)
+        monday = reading_day - timedelta(days=reading_day.weekday())
+        weeks.setdefault(monday, []).append(Decimal(kg))
+    return sorted(weeks.items())
+
+
+def average(values):
+    return sum(values) / len(values)
 
 
 def weight_progress(db, day):
@@ -80,15 +267,10 @@ def weight_progress(db, day):
     if baseline is not None:
         lines.append(f"Since {baseline_day} ({baseline:.2f} kg): {latest - baseline:+.2f} kg")
 
-    weeks = {}
-    for logged_day, kg in rows:
-        reading_day = date.fromisoformat(logged_day)
-        monday = reading_day - timedelta(days=reading_day.weekday())
-        weeks.setdefault(monday, []).append(Decimal(kg))
-    recent = list(weeks.items())[-6:]
+    recent = weekly_averages(rows)[-6:]
     if len(recent) >= 2:
-        (previous_week, previous), (latest_week, current) = recent[-2:]
-        difference = sum(current) / len(current) - sum(previous) / len(previous)
+        (previous_week, previous), (_, current) = recent[-2:]
+        difference = average(current) - average(previous)
         direction = "down" if difference < 0 else "up" if difference > 0 else "steady"
         lines.append(
             f"Latest logged week vs {previous_week:%d %b}: "
@@ -96,41 +278,22 @@ def weight_progress(db, day):
         )
     lines.append("\nWeekly averages (week starting Monday)")
     for monday, readings in recent:
-        count = len(readings)
-        lines.append(f"{monday:%d %b %Y} | {sum(readings) / count:.2f} kg | {count} weigh-in{'s' if count != 1 else ''}")
+        lines.append(f"{monday:%d %b %Y} | {average(readings):.2f} kg | {plural(len(readings), 'weigh-in')}")
     return "\n".join(lines)
 
 
-
-def recent_weight_progress(db, today, week_count):
-    monday = today - timedelta(days=today.weekday())
-    first_week = monday - timedelta(weeks=week_count - 1)
-    rows = db.execute(
-        "SELECT day, kg FROM weights WHERE day BETWEEN ? AND ? ORDER BY day",
-        (first_week.isoformat(), today.isoformat()),
-    ).fetchall()
-    return format_weight_period(rows, first_week, today, f"{week_count} week{'s' if week_count != 1 else ''}")
-
-
-def month_weight_progress(db, today):
-    # "Last month" means the trailing 30 days, including today.
-    first_day = today - timedelta(days=29)
+def period_weight_progress(db, first_day, today, period_label):
     rows = db.execute(
         "SELECT day, kg FROM weights WHERE day BETWEEN ? AND ? ORDER BY day",
         (first_day.isoformat(), today.isoformat()),
     ).fetchall()
-    return format_weight_period(rows, first_day, today, "30 days")
-
-
-def format_weight_period(rows, first_day, today, period_label):
     lines = [f"Weight progress | Last {period_label}: {first_day:%d %b} to {today:%d %b %Y}"]
     if not rows:
         return lines[0] + "\nNo weigh-ins during this period."
 
     first_logged_day, first_kg = rows[0]
     latest_logged_day, latest_kg = rows[-1]
-    first_value = Decimal(first_kg)
-    latest_value = Decimal(latest_kg)
+    first_value, latest_value = Decimal(first_kg), Decimal(latest_kg)
     change = latest_value - first_value
     lines.append(
         f"{first_value:.2f} kg ({first_logged_day}) to {latest_value:.2f} kg "
@@ -138,107 +301,33 @@ def format_weight_period(rows, first_day, today, period_label):
     )
     if first_value:
         lines.append(f"Percentage change: {change / first_value * 100:+.1f}%")
-
     weighins = [Decimal(kg) for _, kg in rows]
-    lines.append(f"Average recorded weight: {sum(weighins) / len(weighins):.2f} kg across {len(rows)} weigh-in{'s' if len(rows) != 1 else ''}")
-
-    week_averages = {}
-    for logged_day, kg in rows:
-        recorded = date.fromisoformat(logged_day)
-        monday = recorded - timedelta(days=recorded.weekday())
-        week_averages.setdefault(monday, []).append(Decimal(kg))
+    lines.append(f"Average recorded weight: {average(weighins):.2f} kg across {plural(len(rows), 'weigh-in')}")
     lines.append("\nWeekly averages (week starting Monday)")
-    for monday, values in sorted(week_averages.items()):
-        lines.append(f"{monday:%d %b} | {sum(values) / len(values):.2f} kg | {len(values)} weigh-in{'s' if len(values) != 1 else ''}")
+    for monday, values in weekly_averages(rows):
+        lines.append(f"{monday:%d %b} | {average(values):.2f} kg | {plural(len(values), 'weigh-in')}")
     return "\n".join(lines)
 
 
-def parse_progress_request(message):
-    phrase = " ".join(message.casefold().replace("’", "'").split()).strip(" ?!.")
-    phrase = re.sub(r"^(please )?", "", phrase)
-    # Match several natural ways of asking for a period.
+def parse_progress_request(phrase):
+    phrase = re.sub(r"^please ", "", phrase.strip(" ?!."))
+    if re.search(r"\b(?:diet|work ?outs?)\b", phrase):
+        return None
     period = re.search(r"\b(?:last|past|previous)\s+(?:(\d+)\s+)?(weeks?|wks?|months?)\b", phrase)
     if period:
         number = int(period.group(1) or 1)
-        unit = period.group(2)
-        if unit.startswith(("month", "months")):
+        if period.group(2).startswith("month"):
             return ("days", 30 * number) if 1 <= number <= 12 else ("invalid", number)
         return ("weeks", number) if 1 <= number <= 52 else ("invalid", number)
-    if re.search(r"\b(?:progress|progressing|doing|weight trend)\b", phrase) and re.search(
-        r"\b(?:weight|progress|progressing|doing|trend)\b", phrase
-    ):
+    if re.search(r"\b(?:progress|progressing|weight trend)\b", phrase) or phrase in PROGRESS_PHRASES:
         return ("all", None)
     return None
 
 
-
-def respond(db, update_id, message, now):
+def handle_progress(db, update_id, message, command, argument, phrase, now):
     day = now.date().isoformat()
-    parts = message.split(maxsplit=1)
-    command = parts[0].lower()
-    argument = parts[1] if len(parts) == 2 else ""
-    phrase = " ".join(message.casefold().split()).rstrip("?.!")
-    phrase = phrase.replace("’", "'")
-
-    if command in ("/start", "/help"):
-        return HELP
-    if command == "/cancel":
-        db.execute("DELETE FROM settings WHERE name = 'pending_diet'")
-        return "Pending diet update cleared."
-    if command == "/diet" or phrase in {
-        "give me present diet chart", "give me my present diet chart",
-        "show my diet", "current diet", "present diet chart",
-    }:
-        row = db.execute(
-            "SELECT effective, chart FROM diets WHERE effective <= ? "
-            "ORDER BY effective DESC, update_id DESC LIMIT 1", (day,)
-        ).fetchone()
-        return f"Diet from {row[0]}\n\n{row[1]}" if row else (
-            'No diet saved yet. Send "Update my diet from today" to add one.'
-        )
-    if command == "/diet_history":
+    if command == "/progress":
         if argument:
-            row = db.execute(
-                "SELECT effective, chart FROM diets WHERE update_id = ?",
-                (argument,),
-            ).fetchone()
-            return f"Diet from {row[0]}\n\n{row[1]}" if row else "Diet version not found."
-        rows = db.execute(
-            "SELECT update_id, effective, chart FROM diets "
-            "ORDER BY effective DESC, update_id DESC LIMIT 10"
-        ).fetchall()
-        return "\n".join(
-            f"{effective} | {chart.splitlines()[0][:60]} | /diet_history {version}"
-            for version, effective, chart in rows
-        ) or "No diet history yet."
-    diet_prompt = re.fullmatch(r"update my diet from today(?:\s*[:\-]\s*(.+))?", message,
-                               flags=re.IGNORECASE | re.DOTALL)
-    if command == "/setdiet" or diet_prompt or phrase == "update my diet from today":
-        chart = argument if command == "/setdiet" else (diet_prompt.group(1) or "").strip() if diet_prompt else ""
-        if chart:
-            return save_diet(db, update_id, day, chart)
-        db.execute("INSERT OR REPLACE INTO settings VALUES ('pending_diet', ?)", (day,))
-        return f"Paste the full diet chart in your next message to save it from {day}."
-    request = parse_progress_request(message)
-    if request:
-        period_kind, amount = request
-        if period_kind == "invalid":
-            return "Please ask for a period from 1 to 52 weeks, or 1 to 12 months."
-        if period_kind == "weeks":
-            return recent_weight_progress(db, now.date(), amount)
-        if period_kind == "days":
-            first_day = now.date() - timedelta(days=amount - 1)
-            rows = db.execute(
-                "SELECT day, kg FROM weights WHERE day BETWEEN ? AND ? ORDER BY day",
-                (first_day.isoformat(), now.date().isoformat()),
-            ).fetchall()
-            return format_weight_period(rows, first_day, now.date(), f"{amount} day{'s' if amount != 1 else ''}")
-        return weight_progress(db, day)
-    if command == "/progress" or phrase in {
-        "show my progress", "show my weight progress", "how am i progressing",
-        "how i am progressing", "weight progress", "progress",
-    }:
-        if command == "/progress" and argument:
             prefix, _, baseline_day = argument.partition(" ")
             if prefix != "start" or not db.execute(
                 "SELECT 1 FROM weights WHERE day = ? AND day <= ?", (baseline_day, day)
@@ -246,61 +335,61 @@ def respond(db, update_id, message, now):
                 return "Use /progress start YYYY-MM-DD with a date from your weight history."
             db.execute("INSERT OR REPLACE INTO settings VALUES ('progress_start', ?)", (baseline_day,))
         return weight_progress(db, day)
-    if command == "/weight_history":
-        rows = db.execute("SELECT day, kg FROM weights ORDER BY day DESC LIMIT 30").fetchall()
-        return "\n".join(f"{date} | {kg} kg" for date, kg in rows) or "No weights logged yet."
-    reading = WEIGHT.fullmatch(phrase if command != "/weight" else f"weight {argument}")
-    if reading:
-        kg = Decimal(reading.group(1).replace(",", "."))
-        if not 0 < kg <= 999:
-            return 'Enter a positive weight in kg, for example "Today weight is 74.5".'
-        value = f"{kg.normalize():f}"
-        db.execute("INSERT OR REPLACE INTO weights VALUES (?, ?)", (day, value))
-        return f"Saved {value} kg for {day}. A new entry today replaces this day's weight."
-    if command == "/weight" or phrase.startswith(("today weight", "today's weight", "my weight")):
-        return 'Enter your weight in kg, for example "Today weight is 74.5".'
-    if command == "/setworkout":
-        weekday, separator, routine = argument.partition(":")
-        weekday = weekday.strip().title()
-        if weekday not in DAYS or not separator or not routine.strip():
-            return "Use /setworkout Monday: Squats 3x8 (use any weekday)."
-        db.execute("INSERT OR REPLACE INTO workouts VALUES (?, ?)", (weekday, routine.strip()))
-        return f"{weekday} workout saved."
-    if command == "/week":
-        workouts = dict(db.execute("SELECT day, routine FROM workouts"))
-        return "\n\n".join(f"{weekday}\n{workouts.get(weekday, 'No workout saved.')}"
-                            for weekday in DAYS)
-    if command == "/workout" or re.search(r"\b(?:workout|work out)\b", phrase):
-        workout_request = argument.casefold().strip() if command == "/workout" else phrase
-        day_match = re.search(
-            r"\b(day after tomorrow|tomorrow|today|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
-            workout_request,
-        )
-        if day_match:
-            requested_day = day_match.group(1)
-            if requested_day == "day after tomorrow":
-                target_date = now.date() + timedelta(days=2)
-                weekday = DAYS[target_date.weekday()]
-            elif requested_day == "tomorrow":
-                target_date = now.date() + timedelta(days=1)
-                weekday = DAYS[target_date.weekday()]
-            elif requested_day == "today":
-                weekday = DAYS[now.weekday()]
-            else:
-                weekday = requested_day.title()
-        elif command == "/workout" and not workout_request:
-            weekday = DAYS[now.weekday()]
-        elif command == "/workout" and workout_request in {"workout", "work out"}:
-            weekday = DAYS[now.weekday()]
-        else:
-            return "Ask for today, tomorrow, or a weekday, such as 'Friday workout'."
-        row = db.execute("SELECT routine FROM workouts WHERE day = ?", (weekday,)).fetchone()
-        return f"{weekday} workout\n\n{row[0]}" if row else (
-            f"No workout saved for {weekday}. Add one using /setworkout {weekday}: ..."
-        )
-    pending = db.execute("SELECT value FROM settings WHERE name = 'pending_diet'").fetchone()
-    if pending and not message.startswith("/"):
-        return save_diet(db, update_id, pending[0], message)
+    if command.startswith("/"):
+        return None
+    request = parse_progress_request(phrase)
+    if not request:
+        return None
+    kind, amount = request
+    if kind == "invalid":
+        return "Please ask for a period from 1 to 52 weeks, or 1 to 12 months."
+    today = now.date()
+    if kind == "weeks":
+        monday = today - timedelta(days=today.weekday())
+        return period_weight_progress(db, monday - timedelta(weeks=amount - 1), today, plural(amount, "week"))
+    if kind == "days":
+        return period_weight_progress(db, today - timedelta(days=amount - 1), today, plural(amount, "day"))
+    return weight_progress(db, day)
+
+
+# -------------------------------------------------------------- routing
+
+# Order matters: strict matches (diet commands, exact weight readings) come before
+# keyword matches (workout), and the broad progress matcher comes last.
+HANDLERS = (handle_diet, handle_weight, handle_workout, handle_progress)
+
+
+def normalise(message):
+    return " ".join(message.casefold().replace("’", "'").split()).rstrip("?.!")
+
+
+def respond(db, update_id, message, now):
+    parts = message.split(maxsplit=1)
+    command = parts[0].lower()
+    if command.startswith("/"):
+        command = command.split("@", 1)[0]  # Accept /week@MyBot forms.
+    argument = parts[1] if len(parts) == 2 else ""
+    phrase = normalise(message)
+
+    if command in ("/start", "/help"):
+        return HELP
+    if command == "/cancel":
+        db.execute("DELETE FROM settings WHERE name = 'pending_diet'")
+        return "Pending diet update cleared."
+
+    # A pending diet paste takes priority over keyword matching, so a chart that
+    # mentions "workout" or "weight" is still saved as the diet.
+    pending_day = pending_diet_day(db, now)
+    if pending_day and not message.startswith("/") and phrase not in EXACT_PHRASES:
+        if len(message.strip()) < MIN_DIET_LENGTH and "\n" not in message.strip():
+            return ("That looks too short for a diet chart. Paste the full chart with meals "
+                    "and quantities, or send /cancel.")
+        return save_diet(db, update_id, pending_day, message)
+
+    for handler in HANDLERS:
+        reply = handler(db, update_id, message, command, argument, phrase, now)
+        if reply is not None:
+            return reply
     return HELP
 
 
@@ -314,59 +403,131 @@ def process(db, update_id, message, now):
         return reply
 
 
+# ------------------------------------------------------------- telegram
+
+class TelegramError(Exception):
+    def __init__(self, code, description, retry_after=None):
+        super().__init__(f"Telegram HTTP {code}: {description}")
+        self.code = code
+        self.description = description
+        self.retry_after = retry_after
+
+
 def telegram(token, method, **payload):
     request = Request(
         f"https://api.telegram.org/bot{token}/{method}",
         data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"},
     )
-    with urlopen(request, timeout=40) as response:
-        result = json.load(response)
-    if not result["ok"]:
-        raise RuntimeError("Telegram API request failed")
+    try:
+        with urlopen(request, timeout=40) as response:
+            result = json.load(response)
+    except HTTPError as error:
+        try:
+            body = json.load(error)
+        except ValueError:
+            body = {}
+        raise TelegramError(
+            error.code, body.get("description", error.reason),
+            body.get("parameters", {}).get("retry_after"),
+        ) from None
+    if not result.get("ok"):
+        raise TelegramError(0, result.get("description", "request failed"))
     return result["result"]
+
+
+def split_message(text, limit=TELEGRAM_TEXT_LIMIT):
+    """Split text into chunks within Telegram's limit, preferring line breaks."""
+    chunks, current = [], ""
+    for line in text.split("\n"):
+        while len(line) > limit:  # A single very long line: hard-split it.
+            if current:
+                chunks.append(current)
+                current = ""
+            chunks.append(line[:limit])
+            line = line[limit:]
+        candidate = f"{current}\n{line}" if current else line
+        if len(candidate) > limit:
+            chunks.append(current)
+            current = line
+        else:
+            current = candidate
+    if current or not chunks:
+        chunks.append(current)
+    return chunks
+
+
+def send_reply(token, chat_id, reply):
+    """Send a reply. Network errors propagate so the update is retried; API rejections are logged."""
+    for chunk in split_message(reply):
+        for attempt in range(3):
+            try:
+                telegram(token, "sendMessage", chat_id=chat_id, text=chunk)
+                break
+            except TelegramError as error:
+                if error.retry_after and attempt < 2:
+                    log.warning("Rate limited by Telegram; waiting %ss.", error.retry_after)
+                    time.sleep(error.retry_after)
+                    continue
+                log.error("Could not send reply to chat %s: %s", chat_id, error)
+                return
+
+
+def handle_update(db, token, owner, update):
+    msg = update.get("message") or {}
+    sender = msg.get("from", {}).get("id")
+    message = (msg.get("text") or "").strip()
+    chat = msg.get("chat", {})
+    if chat.get("type") != "private" or not message:
+        return
+
+    reply = None
+    if owner is None and message in {"/id", "/start"} and sender:
+        reply = f"Your Telegram user ID is {sender}."
+    elif owner is not None and sender == owner:
+        log.info("Update %s: %s", update["update_id"], message.split("\n", 1)[0][:80])
+        try:
+            now = datetime.fromtimestamp(msg["date"], IST)
+            reply = process(db, update["update_id"], message, now)
+        except Exception:
+            # Never let one bad message block the queue: log it and move on.
+            log.exception("Failed to handle update %s", update["update_id"])
+            reply = "Something went wrong handling that message. It has been logged; please try again."
+    if reply:
+        send_reply(token, chat["id"], reply)
 
 
 def run(db, token, owner):
     saved = db.execute("SELECT value FROM settings WHERE name = 'offset'").fetchone()
     offset = int(saved[0]) if saved else 0
+    log.info("Polling Telegram%s.", "" if owner else " (owner not set: only /id is answered)")
     while True:
         try:
             updates = telegram(token, "getUpdates", offset=offset, timeout=25,
                                allowed_updates=["message"])
             for update in updates:
                 update_id = update["update_id"]
-                msg = update.get("message", {})
-                sender = msg.get("from", {}).get("id")
-                message = msg.get("text", "").strip()
-                chat = msg.get("chat", {})
-                if chat.get("type") == "private" and message:
-                    reply = None
-                    if owner is None and message in {"/id", "/start"} and sender:
-                        reply = f"Your Telegram user ID is {sender}."
-                    elif sender == owner and owner is not None:
-                        now = datetime.fromtimestamp(msg["date"], IST)
-                        reply = process(db, update_id, message, now)
-                    if reply:
-                        for start in range(0, len(reply), 1800):
-                            telegram(token, "sendMessage", chat_id=chat["id"],
-                                     text=reply[start:start + 1800])
+                handle_update(db, token, owner, update)
                 with db:
-                    next_offset = update_id + 1
                     db.execute("INSERT OR REPLACE INTO settings VALUES ('offset', ?)",
-                               (str(next_offset),))
+                               (str(update_id + 1),))
                     db.execute("DELETE FROM replies WHERE update_id <= ?", (update_id,))
-                offset = next_offset
-        except HTTPError as error:
+                offset = update_id + 1
+        except TelegramError as error:
             if error.code in (401, 404, 409):
-                sys.exit(f"Telegram returned HTTP {error.code}. Check the token and ensure only one poller is running.")
-            print(f"Telegram returned HTTP {error.code}. Retrying.", file=sys.stderr)
+                sys.exit(f"{error}. Check the token and ensure only one poller is running.")
+            wait = error.retry_after or 5
+            log.warning("%s. Retrying in %ss.", error, wait)
+            time.sleep(wait)
+        except (URLError, TimeoutError, ConnectionError):
+            log.warning("Telegram connection interrupted. Retrying in 5s.")
             time.sleep(5)
-        except (URLError, TimeoutError):
-            print("Telegram connection interrupted. Retrying.", file=sys.stderr)
+        except ValueError:
+            log.exception("Unreadable response from Telegram. Retrying in 5s.")
             time.sleep(5)
 
 
 def main():
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:
         sys.exit("Set TELEGRAM_BOT_TOKEN first.")
