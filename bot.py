@@ -12,6 +12,8 @@ from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+import body_composition as body
+
 log = logging.getLogger("fitness-bot")
 
 IST = timezone(timedelta(hours=5, minutes=30), "IST")
@@ -34,7 +36,11 @@ Log an earlier day with /weight 2026-11-20 74.2.
 Send /progress or 'How am I progressing?' for your weight trend.
 Ask 'Give my progress for last 3 weeks' for a shorter report.
 Use /diet_history or /weight_history to see recent entries.
-Use /cancel to cancel a pending diet update."""
+Use /cancel to cancel a pending diet update.
+
+Send a Dr Trust results screenshot to log body composition.
+Add a caption like "yesterday" or "2026-11-20" for an earlier day.
+See it with /body, /body trend or /body_history."""
 
 DIET_SHOW_PHRASES = {
     "give me present diet chart", "give me my present diet chart",
@@ -77,6 +83,9 @@ def connect(path):
         );
         CREATE TABLE IF NOT EXISTS replies (
             update_id INTEGER PRIMARY KEY, reply TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS body_composition (
+            day TEXT PRIMARY KEY, data TEXT NOT NULL
         );
     """)
     return db
@@ -352,11 +361,146 @@ def handle_progress(db, update_id, message, command, argument, phrase, now):
     return weight_progress(db, day)
 
 
+# ----------------------------------------------------- body composition
+
+YES = {"yes", "y", "save", "ok", "okay", "confirm", "yes save"}
+NO = {"no", "n", "discard", "cancel"}
+
+
+def photo_day(caption, today):
+    """Pick the reading's date from a caption: 'yesterday', a YYYY-MM-DD date, or today."""
+    text = (caption or "").casefold()
+    if "yesterday" in text:
+        return today - timedelta(days=1), None
+    match = re.search(r"\d{4}-\d{2}-\d{2}", text)
+    if match:
+        try:
+            day = date.fromisoformat(match.group(0))
+        except ValueError:
+            return None, "That caption date isn't a real date. Use YYYY-MM-DD."
+        if day > today:
+            return None, "You can't log a reading for a future date."
+        return day, None
+    return today, None
+
+
+def stage_body_reading(db, reading, day, now):
+    value = json.dumps({"day": day.isoformat(), "since": now.isoformat(), "reading": reading})
+    db.execute("INSERT OR REPLACE INTO settings VALUES ('pending_body', ?)", (value,))
+    return body.format_preview(reading, day.isoformat())
+
+
+def pending_body(db, now):
+    row = db.execute("SELECT value FROM settings WHERE name = 'pending_body'").fetchone()
+    if not row:
+        return None
+    pending = json.loads(row[0])
+    if now - datetime.fromisoformat(pending["since"]) > PENDING_DIET_TTL:
+        db.execute("DELETE FROM settings WHERE name = 'pending_body'")
+        return None
+    return pending
+
+
+def save_body_reading(db, day, reading):
+    db.execute("INSERT OR REPLACE INTO body_composition VALUES (?, ?)", (day, json.dumps(reading)))
+    weight = reading["values"]["weight_kg"]
+    db.execute("INSERT OR REPLACE INTO weights VALUES (?, ?)", (day, f"{Decimal(str(weight)).normalize():f}"))
+    db.execute("DELETE FROM settings WHERE name = 'pending_body'")
+    return (f"Body composition saved for {day}. Weight {weight:g} kg also logged for /progress. "
+            "See it any time with /body.")
+
+
+def handle_pending_body(db, phrase, now):
+    """Answer yes / no / corrections for a staged screenshot reading. None if not applicable."""
+    pending = pending_body(db, now)
+    if not pending:
+        return None
+    if phrase in YES:
+        return save_body_reading(db, pending["day"], pending["reading"])
+    if phrase in NO:
+        db.execute("DELETE FROM settings WHERE name = 'pending_body'")
+        return "Body composition reading discarded."
+    corrections = body.parse_corrections(phrase)
+    if not corrections:
+        return None
+    pending["reading"]["values"].update(corrections)
+    for key in corrections:
+        pending["reading"].get("statuses", {}).pop(key, None)  # The old badge may no longer apply.
+    pending["since"] = now.isoformat()
+    db.execute("INSERT OR REPLACE INTO settings VALUES ('pending_body', ?)", (json.dumps(pending),))
+    return body.format_preview(pending["reading"], pending["day"])
+
+
+TREND_KEYS = ("weight_kg", "body_fat_pct", "fat_mass_kg", "muscle_mass_kg", "skeletal_muscle_kg",
+              "body_water_pct", "visceral_fat", "bmr_kcal", "body_score")
+
+
+def body_trend(db, today, weeks):
+    first_day = today - timedelta(weeks=weeks)
+    rows = db.execute(
+        "SELECT day, data FROM body_composition WHERE day BETWEEN ? AND ? ORDER BY day",
+        (first_day.isoformat(), today.isoformat()),
+    ).fetchall()
+    heading = f"Body composition | Last {plural(weeks, 'week')}"
+    if len(rows) < 2:
+        return heading + "\nYou need at least two readings in this period. Send another screenshot later."
+    (start_day, start), (end_day, end) = rows[0], rows[-1]
+    start, end = json.loads(start)["values"], json.loads(end)["values"]
+    lines = [f"{heading}: {start_day} to {end_day} ({plural(len(rows), 'reading')})"]
+    for key in TREND_KEYS:
+        if key in start and key in end:
+            metric = body.METRIC_BY_KEY[key]
+            change = end[key] - start[key]
+            sign = "+" if change > 0 else "-" if change < 0 else "±"
+            unit = "%" if metric.unit == "%" else f" {metric.unit}" if metric.unit else ""
+            lines.append(f"{metric.label}: {metric.format(start[key])} to {metric.format(end[key])} "
+                         f"({sign}{abs(change):.2f}{unit})")
+    if "fat_mass_kg" in start and "fat_mass_kg" in end and "muscle_mass_kg" in start and "muscle_mass_kg" in end:
+        fat = end["fat_mass_kg"] - start["fat_mass_kg"]
+        muscle = end["muscle_mass_kg"] - start["muscle_mass_kg"]
+        if fat < 0 <= muscle:
+            lines.append("\nFat is down while muscle held or grew.")
+        elif fat < 0 and muscle < 0:
+            lines.append("\nFat and muscle both dropped. Protein and strength training help protect muscle.")
+        elif fat > 0:
+            lines.append("\nFat mass is up over this period.")
+    return "\n".join(lines)
+
+
+def handle_body(db, update_id, message, command, argument, phrase, now):
+    if command == "/body_history":
+        rows = db.execute("SELECT day, data FROM body_composition ORDER BY day DESC LIMIT 20").fetchall()
+        lines = []
+        for day, data in rows:
+            values = json.loads(data)["values"]
+            fat = f" | fat {values['body_fat_pct']:g}%" if "body_fat_pct" in values else ""
+            lines.append(f"{day} | {values['weight_kg']:g} kg{fat} | /body {day}")
+        return "\n".join(lines) or "No body composition readings yet. Send a Dr Trust screenshot."
+    if command != "/body":
+        return None
+    argument = argument.strip().casefold()
+    trend = re.fullmatch(r"trend(?:\s+(\d{1,2}))?", argument)
+    if trend:
+        weeks = int(trend.group(1) or 4)
+        if not 1 <= weeks <= 52:
+            return "Use /body trend with 1 to 52 weeks, for example /body trend 8."
+        return body_trend(db, now.date(), weeks)
+    if argument:
+        row = db.execute("SELECT day, data FROM body_composition WHERE day = ?", (argument,)).fetchone()
+        if not row:
+            return "No reading for that date. See /body_history for saved dates."
+    else:
+        row = db.execute("SELECT day, data FROM body_composition ORDER BY day DESC LIMIT 1").fetchone()
+        if not row:
+            return "No body composition readings yet. Send a Dr Trust screenshot."
+    return body.format_reading(json.loads(row[1]), f"Body composition for {row[0]}", show_all_statuses=True)
+
+
 # -------------------------------------------------------------- routing
 
 # Order matters: strict matches (diet commands, exact weight readings) come before
 # keyword matches (workout), and the broad progress matcher comes last.
-HANDLERS = (handle_diet, handle_weight, handle_workout, handle_progress)
+HANDLERS = (handle_body, handle_diet, handle_weight, handle_workout, handle_progress)
 
 
 def normalise(message):
@@ -374,8 +518,13 @@ def respond(db, update_id, message, now):
     if command in ("/start", "/help"):
         return HELP
     if command == "/cancel":
-        db.execute("DELETE FROM settings WHERE name = 'pending_diet'")
-        return "Pending diet update cleared."
+        db.execute("DELETE FROM settings WHERE name IN ('pending_diet', 'pending_body')")
+        return "Pending updates cleared."
+
+    if not message.startswith("/"):
+        reply = handle_pending_body(db, phrase, now)
+        if reply is not None:
+            return reply
 
     # A pending diet paste takes priority over keyword matching, so a chart that
     # mentions "workout" or "weight" is still saved as the diet.
@@ -391,6 +540,25 @@ def respond(db, update_id, message, now):
         if reply is not None:
             return reply
     return HELP
+
+
+def process_photo(db, update_id, caption, now, load_image, extract):
+    """Read a screenshot and stage it for confirmation. Network calls happen outside the transaction."""
+    row = db.execute("SELECT reply FROM replies WHERE update_id = ?", (update_id,)).fetchone()
+    if row:
+        return row[0]
+    day, problem = photo_day(caption, now.date())
+    reading = None
+    if not problem:
+        try:
+            image, mime_type = load_image()
+            reading = body.normalise(extract(image, mime_type))
+        except body.BodyExtractionError as error:
+            problem = str(error)
+    with db:
+        reply = problem or stage_body_reading(db, reading, day, now)
+        db.execute("INSERT OR REPLACE INTO replies VALUES (?, ?)", (update_id, reply))
+    return reply
 
 
 def process(db, update_id, message, now):
@@ -472,12 +640,59 @@ def send_reply(token, chat_id, reply):
                 return
 
 
-def handle_update(db, token, owner, update):
+def image_in(msg):
+    """Return (file_id, mime_type) for a photo or an image sent as a file, else None."""
+    if msg.get("photo"):
+        largest = max(msg["photo"], key=lambda size: size.get("file_size", 0) or size.get("width", 0))
+        return largest["file_id"], "image/jpeg"
+    document = msg.get("document") or {}
+    if str(document.get("mime_type", "")).startswith("image/"):
+        return document["file_id"], document["mime_type"]
+    return None
+
+
+def download_telegram_file(token, file_id):
+    info = telegram(token, "getFile", file_id=file_id)
+    if info.get("file_size", 0) > body.MAX_IMAGE_BYTES:
+        raise body.BodyExtractionError("That image is too large. Send a screenshot under 10 MB.")
+    try:
+        with urlopen(f"https://api.telegram.org/file/bot{token}/{info['file_path']}", timeout=60) as response:
+            return response.read(body.MAX_IMAGE_BYTES + 1)
+    except (URLError, TimeoutError):
+        raise body.BodyExtractionError("Couldn't download the image from Telegram. Please send it again.") from None
+
+
+def gemini_extractor():
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    model = os.environ.get("GEMINI_MODEL", "").strip() or body.DEFAULT_GEMINI_MODEL
+    return lambda image, mime_type: body.extract_with_gemini(image, mime_type, api_key, model)
+
+
+def handle_update(db, token, owner, update, extract=None):
     msg = update.get("message") or {}
     sender = msg.get("from", {}).get("id")
     message = (msg.get("text") or "").strip()
     chat = msg.get("chat", {})
-    if chat.get("type") != "private" or not message:
+    image = image_in(msg)
+    if chat.get("type") != "private" or not (message or image):
+        return
+
+    if image and not message:
+        if owner is None or sender != owner:
+            return
+        log.info("Update %s: image", update["update_id"])
+        file_id, mime_type = image
+        try:
+            now = datetime.fromtimestamp(msg["date"], IST)
+            reply = process_photo(
+                db, update["update_id"], msg.get("caption", ""), now,
+                lambda: (download_telegram_file(token, file_id), mime_type),
+                extract or gemini_extractor(),
+            )
+        except Exception:
+            log.exception("Failed to handle image update %s", update["update_id"])
+            reply = "Something went wrong reading that image. It has been logged; please try again."
+        send_reply(token, chat["id"], reply)
         return
 
     reply = None
