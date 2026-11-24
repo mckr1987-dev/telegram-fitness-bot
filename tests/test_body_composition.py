@@ -170,6 +170,22 @@ class GeminiRequestTests(unittest.TestCase):
         with self.assertRaisesRegex(body.BodyExtractionError, "busy right now"):
             body.extract_with_gemini(b"img", "image/png", "KEY", opener=opener, sleep=lambda s: None)
 
+    def test_timeout_message_names_the_cause(self):
+        def opener(request, timeout):
+            raise TimeoutError("timed out")
+
+        with self.assertRaisesRegex(body.BodyExtractionError, "longer than 90 seconds"):
+            body.extract_with_gemini(b"img", "image/png", "KEY", opener=opener)
+
+    def test_connection_error_message_names_the_cause(self):
+        from urllib.error import URLError
+
+        def opener(request, timeout):
+            raise URLError("getaddrinfo failed")
+
+        with self.assertRaisesRegex(body.BodyExtractionError, r"Couldn't reach Gemini \(getaddrinfo failed\)"):
+            body.extract_with_gemini(b"img", "image/png", "KEY", opener=opener)
+
     def test_missing_key(self):
         with self.assertRaisesRegex(body.BodyExtractionError, "GEMINI_API_KEY"):
             body.extract_with_gemini(b"img", "image/png", "")

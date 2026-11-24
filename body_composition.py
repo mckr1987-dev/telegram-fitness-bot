@@ -14,7 +14,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models"
-DEFAULT_GEMINI_MODEL = "gemini-3.8-flash"
+DEFAULT_GEMINI_MODEL = "gemini-flash-latest"  # Alias that follows Google's current Flash model.
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 RETRY_WAITS = (3, 8, 20)  # seconds between retries when Gemini is busy (HTTP 500/503)
 
@@ -189,8 +189,19 @@ def extract_with_gemini(image_bytes, mime_type, api_key, model=DEFAULT_GEMINI_MO
             if error.code == 429:
                 raise BodyExtractionError("Gemini quota or rate limit reached. Try again in a minute.") from None
             raise BodyExtractionError(f"Gemini returned an error ({error.code}): {message}") from None
-        except (URLError, TimeoutError):
-            raise BodyExtractionError("Couldn't reach Gemini. Please send the screenshot again.") from None
+        except TimeoutError:
+            raise BodyExtractionError(
+                f"Gemini took longer than {timeout} seconds to answer (model may be overloaded). "
+                "Please send the screenshot again, or set GEMINI_MODEL to another Flash model."
+            ) from None
+        except URLError as error:
+            reason = error.reason
+            if isinstance(reason, TimeoutError) or "timed out" in str(reason):
+                raise BodyExtractionError(
+                    f"Gemini took longer than {timeout} seconds to answer (model may be overloaded). "
+                    "Please send the screenshot again, or set GEMINI_MODEL to another Flash model."
+                ) from None
+            raise BodyExtractionError(f"Couldn't reach Gemini ({reason}). Please send the screenshot again.") from None
         try:
             candidate_parts = result["candidates"][0]["content"]["parts"]
         except (KeyError, IndexError, TypeError):
