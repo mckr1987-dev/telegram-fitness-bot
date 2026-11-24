@@ -9,12 +9,14 @@ import json
 import os
 import re
 import sys
+import time
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 DEFAULT_GEMINI_MODEL = "gemini-3.8-flash"
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
+RETRY_WAITS = (3, 8, 20)  # seconds between retries when Gemini is busy (HTTP 500/503)
 
 
 class BodyExtractionError(Exception):
@@ -136,8 +138,19 @@ def parse_json_text(text):
         raise BodyExtractionError("Gemini returned data I couldn't read. Please try the screenshot again.") from None
 
 
+def _post_with_retry(url, payload, api_key, timeout, opener, sleep):
+    """Post to Gemini, retrying a few times when the model is temporarily overloaded."""
+    for wait in (*RETRY_WAITS, None):
+        try:
+            return _post_json(url, payload, api_key, timeout, opener)
+        except HTTPError as error:
+            if error.code not in (500, 503) or wait is None:
+                raise
+            sleep(wait)
+
+
 def extract_with_gemini(image_bytes, mime_type, api_key, model=DEFAULT_GEMINI_MODEL,
-                        timeout=90, opener=urlopen):
+                        timeout=90, opener=urlopen, sleep=time.sleep):
     """Send the screenshot to Gemini and return its raw JSON answer as a dict."""
     if not api_key:
         raise BodyExtractionError(
@@ -158,7 +171,7 @@ def extract_with_gemini(image_bytes, mime_type, api_key, model=DEFAULT_GEMINI_MO
     for attempt, config in enumerate(configs):
         payload = {"contents": [{"role": "user", "parts": parts}], "generationConfig": config}
         try:
-            result = _post_json(url, payload, api_key, timeout, opener)
+            result = _post_with_retry(url, payload, api_key, timeout, opener, sleep)
         except HTTPError as error:
             message = _error_message(error)
             if error.code == 400 and attempt == 0 and "api key" not in message.casefold():
@@ -168,6 +181,10 @@ def extract_with_gemini(image_bytes, mime_type, api_key, model=DEFAULT_GEMINI_MO
             if error.code == 404:
                 raise BodyExtractionError(
                     f"Gemini model '{model}' was not found. Set GEMINI_MODEL to a current Flash model."
+                ) from None
+            if error.code in (500, 503):
+                raise BodyExtractionError(
+                    "Gemini is busy right now (high demand). Please send the screenshot again in a few minutes."
                 ) from None
             if error.code == 429:
                 raise BodyExtractionError("Gemini quota or rate limit reached. Try again in a minute.") from None

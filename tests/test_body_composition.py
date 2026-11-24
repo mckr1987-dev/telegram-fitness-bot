@@ -148,6 +148,28 @@ class GeminiRequestTests(unittest.TestCase):
         with self.assertRaisesRegex(body.BodyExtractionError, "GEMINI_MODEL"):
             body.extract_with_gemini(b"img", "image/png", "KEY", "old-model", opener=opener)
 
+    def test_busy_model_is_retried(self):
+        calls, waits = [], []
+
+        def opener(request, timeout):
+            calls.append(1)
+            if len(calls) < 3:
+                raise HTTPError(request.full_url, 503, "Unavailable", {},
+                                io.BytesIO(b'{"error": {"message": "high demand"}}'))
+            return gemini_reply(SCREENSHOT)
+
+        raw = body.extract_with_gemini(b"img", "image/png", "KEY", opener=opener, sleep=waits.append)
+        self.assertEqual(raw["metrics"]["weight_kg"], 74.45)
+        self.assertEqual(waits, [3, 8])
+
+    def test_busy_model_gives_up_with_friendly_message(self):
+        def opener(request, timeout):
+            raise HTTPError(request.full_url, 503, "Unavailable", {},
+                            io.BytesIO(b'{"error": {"message": "high demand"}}'))
+
+        with self.assertRaisesRegex(body.BodyExtractionError, "busy right now"):
+            body.extract_with_gemini(b"img", "image/png", "KEY", opener=opener, sleep=lambda s: None)
+
     def test_missing_key(self):
         with self.assertRaisesRegex(body.BodyExtractionError, "GEMINI_API_KEY"):
             body.extract_with_gemini(b"img", "image/png", "")
