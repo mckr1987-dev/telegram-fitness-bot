@@ -10,17 +10,15 @@ import os
 import re
 import sys
 import time
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.request import urlopen
 
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models"
-DEFAULT_GEMINI_MODEL = "gemini-flash-latest"  # Alias that follows Google's current Flash model.
+import gemini
+
+DEFAULT_GEMINI_MODEL = gemini.DEFAULT_MODEL
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
-RETRY_WAITS = (3, 8, 20)  # seconds between retries when Gemini is busy (HTTP 500/503)
 
-
-class BodyExtractionError(Exception):
-    """A problem the user should be told about in plain words."""
+# Gemini errors and screenshot problems are both shown to the user as-is.
+BodyExtractionError = gemini.GeminiError
 
 
 class Metric:
@@ -111,22 +109,6 @@ SCHEMA = {
 
 # --------------------------------------------------------------- Gemini
 
-def _post_json(url, payload, api_key, timeout, opener):
-    request = Request(
-        url, data=json.dumps(payload).encode(),
-        headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
-    )
-    with opener(request, timeout=timeout) as response:
-        return json.load(response)
-
-
-def _error_message(error):
-    try:
-        return json.load(error).get("error", {}).get("message", error.reason)
-    except (ValueError, AttributeError):
-        return str(error.reason)
-
-
 def parse_json_text(text):
     """Pull the JSON object out of a model reply, tolerating ```json fences or stray text."""
     start, end = text.find("{"), text.rfind("}")
@@ -138,24 +120,9 @@ def parse_json_text(text):
         raise BodyExtractionError("Gemini returned data I couldn't read. Please try the screenshot again.") from None
 
 
-def _post_with_retry(url, payload, api_key, timeout, opener, sleep):
-    """Post to Gemini, retrying a few times when the model is temporarily overloaded."""
-    for wait in (*RETRY_WAITS, None):
-        try:
-            return _post_json(url, payload, api_key, timeout, opener)
-        except HTTPError as error:
-            if error.code not in (500, 503) or wait is None:
-                raise
-            sleep(wait)
-
-
 def extract_with_gemini(image_bytes, mime_type, api_key, model=DEFAULT_GEMINI_MODEL,
                         timeout=90, opener=urlopen, sleep=time.sleep):
     """Send the screenshot to Gemini and return its raw JSON answer as a dict."""
-    if not api_key:
-        raise BodyExtractionError(
-            "Reading screenshots isn't set up yet. Add GEMINI_API_KEY to the bot's environment file."
-        )
     if len(image_bytes) > MAX_IMAGE_BYTES:
         raise BodyExtractionError("That image is too large. Send a screenshot under 10 MB.")
     parts = [
@@ -167,48 +134,8 @@ def extract_with_gemini(image_bytes, mime_type, api_key, model=DEFAULT_GEMINI_MO
         {"responseFormat": {"text": {"mimeType": "application/json", "schema": SCHEMA}}},
         {"responseMimeType": "application/json"},
     )
-    url = f"{GEMINI_URL}/{model}:generateContent"
-    for attempt, config in enumerate(configs):
-        payload = {"contents": [{"role": "user", "parts": parts}], "generationConfig": config}
-        try:
-            result = _post_with_retry(url, payload, api_key, timeout, opener, sleep)
-        except HTTPError as error:
-            message = _error_message(error)
-            if error.code == 400 and attempt == 0 and "api key" not in message.casefold():
-                continue
-            if error.code in (401, 403) or "api key" in message.casefold():
-                raise BodyExtractionError("Gemini rejected the API key. Check GEMINI_API_KEY.") from None
-            if error.code == 404:
-                raise BodyExtractionError(
-                    f"Gemini model '{model}' was not found. Set GEMINI_MODEL to a current Flash model."
-                ) from None
-            if error.code in (500, 503):
-                raise BodyExtractionError(
-                    "Gemini is busy right now (high demand). Please send the screenshot again in a few minutes."
-                ) from None
-            if error.code == 429:
-                raise BodyExtractionError("Gemini quota or rate limit reached. Try again in a minute.") from None
-            raise BodyExtractionError(f"Gemini returned an error ({error.code}): {message}") from None
-        except TimeoutError:
-            raise BodyExtractionError(
-                f"Gemini took longer than {timeout} seconds to answer (model may be overloaded). "
-                "Please send the screenshot again, or set GEMINI_MODEL to another Flash model."
-            ) from None
-        except URLError as error:
-            reason = error.reason
-            if isinstance(reason, TimeoutError) or "timed out" in str(reason):
-                raise BodyExtractionError(
-                    f"Gemini took longer than {timeout} seconds to answer (model may be overloaded). "
-                    "Please send the screenshot again, or set GEMINI_MODEL to another Flash model."
-                ) from None
-            raise BodyExtractionError(f"Couldn't reach Gemini ({reason}). Please send the screenshot again.") from None
-        try:
-            candidate_parts = result["candidates"][0]["content"]["parts"]
-        except (KeyError, IndexError, TypeError):
-            raise BodyExtractionError("Gemini didn't return a result for that image (it may have been blocked).") from None
-        text = "".join(p.get("text", "") for p in candidate_parts if not p.get("thought"))
-        return parse_json_text(text)
-    raise BodyExtractionError("Gemini couldn't process that image.")
+    text = gemini.generate(parts, api_key, model, configs, timeout, opener, sleep)
+    return parse_json_text(text)
 
 
 # ---------------------------------------------------------- validation

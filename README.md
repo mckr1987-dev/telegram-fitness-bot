@@ -39,6 +39,12 @@ A private, single-user bot for your weekly workouts, diet versions, and daily we
 | /body | Shows the latest body composition reading. Add a date (`/body 2026-11-20`) for an earlier one. |
 | /body trend | Compares your first and latest readings over the last 4 weeks. Use `/body trend 8` for another period. |
 | /body_history | Lists recent readings with weight and body fat. |
+| /trend | Shows your smoothed weight trend, weekly rate over the last 4 weeks, and goal forecast. The trend also appears after each weigh-in and in /progress. |
+| /goal 70 | Sets a goal weight and forecasts when you'll reach it at the current rate. `/goal clear` removes it. Losing faster than about 1% of body weight per week is flagged. |
+| /done | Logs today's workout as done. Also understands "workout done", "did my workout", and `/done yesterday` or `/done 2026-11-20`. |
+| /skip knee sore | Logs a skipped workout with an optional reason. Also understands "skipped workout, knee sore". |
+| /adherence | Shows this week's workouts against your plan. `/adherence 4` summarises the last 4 weeks. Days whose plan starts with "Rest" don't count. |
+| /coach | Asks Gemini for a short review of your week: weight trend, body composition changes, workouts and diet, with up to 3 actions. It is also sent automatically on Sundays at 7 pm IST; `/coach off` stops that. |
 | /cancel | Clears a pending diet update or screenshot reading. |
 
 The bot starts with empty plans. Paste the diet and workouts you currently follow. Dates and weekdays use India Standard Time. SQLite data survives a restart in fitness.sqlite3 beside bot.py. Stop the process before copying that file as a backup. Set FITNESS_DB_PATH to use a different existing directory.
@@ -54,6 +60,10 @@ To check what Gemini reads before deploying:
     $env:GEMINI_API_KEY = Read-Host "Gemini API key" -MaskInput
     python body_composition.py screenshot.jpg
 
+## Weekly coach
+
+The coach sends Gemini a plain-text summary of your last few weeks (weights, trend, body composition, workout log, weekly plan and current diet). It is told to use only that data, not to give medical advice, and never to suggest losing more than about 1% of body weight per week. Treat it as encouragement and a second look at your numbers, not as medical or dietetic advice.
+
 ## Run the tests
 
     python -m unittest discover -s tests -v
@@ -62,7 +72,7 @@ The tests use an in-memory database and never contact Telegram. GitHub Actions r
 
 ## Deploy on Ubuntu EC2
 
-Copy `bot.py`, `body_composition.py`, `fitness-bot.service`, and your existing `fitness.sqlite3` to the instance. Create the data directory at `/opt/fitness-bot/data`, keep the database there, and install the service file as `/etc/systemd/system/fitness-bot.service`.
+Copy `bot.py`, `body_composition.py`, `gemini.py`, `insights.py`, `fitness-bot.service`, and your existing `fitness.sqlite3` to the instance. Create the data directory at `/opt/fitness-bot/data`, keep the database there, and install the service file as `/etc/systemd/system/fitness-bot.service`.
 
 Copy `fitness-bot.env.example` to `/etc/fitness-bot.env`, then edit that server-side file to enter your new Telegram token and Telegram owner ID. Keep the environment file private with root-only read permissions (`sudo chmod 600 /etc/fitness-bot.env`). The example file contains placeholders only.
 
